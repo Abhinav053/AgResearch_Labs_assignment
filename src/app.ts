@@ -38,12 +38,12 @@ export function buildApp(options: AppOptions = {}) {
   const batchController = new BatchController(batchService, harvestService);
 
   // Global Error Handler
-  fastify.setErrorHandler((error, _request, reply) => {
-    if (error instanceof ZodError || error.name === 'ZodError') {
-      const zodErr = error as ZodError;
-      const messages = zodErr.errors
-        ? zodErr.errors.map((e) => `${e.path.join('.')}: ${e.message}`).join('; ')
-        : zodErr.message;
+  fastify.setErrorHandler((error: any, _request, reply) => {
+    if (error instanceof ZodError || error?.name === 'ZodError') {
+      const issues = error.issues || error.errors;
+      const messages = Array.isArray(issues)
+        ? issues.map((e: any) => `${e.path.join('.')}: ${e.message}`).join('; ')
+        : error.message;
       return reply.status(400).send({
         error: {
           code: 'VALIDATION_ERROR',
@@ -52,7 +52,7 @@ export function buildApp(options: AppOptions = {}) {
       });
     }
 
-    if (error instanceof AppError || (error as any).isAppError) {
+    if (error instanceof AppError || error?.isAppError) {
       const appErr = error as AppError;
       return reply.status(appErr.statusCode).send({
         error: {
@@ -63,7 +63,7 @@ export function buildApp(options: AppOptions = {}) {
     }
 
     // Fastify built-in HTTP errors (e.g. 400 Bad Request on JSON parse failure)
-    if (error.statusCode && error.statusCode < 500) {
+    if (error?.statusCode && error.statusCode < 500) {
       return reply.status(error.statusCode).send({
         error: {
           code: 'BAD_REQUEST',

@@ -11,11 +11,9 @@ export const createHarvestSchema = z.object({
     .regex(dateStringRegex, 'harvested_on must be in YYYY-MM-DD format')
     .refine((val) => !isNaN(Date.parse(val)), 'harvested_on must be a valid date'),
   weight_grams: z
-    .number({ invalid_type_error: 'weight_grams must be a number' })
+    .number()
     .gte(0, 'weight_grams cannot be negative'),
-  grade: z.enum(HARVEST_GRADES, {
-    errorMap: () => ({ message: 'grade must be A, B, or C' }),
-  }),
+  grade: z.enum(['A', 'B', 'C']),
 });
 
 export type CreateHarvestInput = z.infer<typeof createHarvestSchema>;
