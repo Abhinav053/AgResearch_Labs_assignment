@@ -14,7 +14,7 @@ The system tracks physical growing surfaces (**Trays**), plant cultivation lifec
 - **Language**: TypeScript (Strict mode enabled)
 - **Web Framework**: Fastify (Selected for native async performance, schema integration, and fast in-process HTTP injection testing)
 - **Validation**: Zod (Ensures runtime validation and strict request decoding)
-- **Database**: PostgreSQL (Source of truth for database constraints, partial unique indexing, and ACID transactions in Phase 2 & 3)
+- **Database**: PostgreSQL (Source of truth for database constraints, partial unique indexing, and ACID transactions)
 - **Database Driver**: `pg` (Native Node PostgreSQL driver)
 - **Testing**: Vitest (Fast test runner for unit and integration testing)
 
@@ -90,37 +90,81 @@ SEEDED ──► GERMINATION ──► GROWING ──► HARVEST_READY ──►
 
 ## Phase 1 — In-Memory REST API
 
-### What Was Implemented
-- Fastify server configuration with TypeScript.
-- Comprehensive request validation schemas powered by Zod.
-- Standardized error handling middleware formatting all error responses into `{ "error": { "code": "...", "message": "..." } }`.
-- Domain entities: `Tray` and `Batch`.
-- In-memory repositories (`InMemoryTrayRepository`, `InMemoryBatchRepository`).
-- Core Endpoints:
-  - `POST /trays`: Create a tray.
-  - `GET /trays`: List all trays.
-  - `GET /trays/:id`: Retrieve single tray by ID (404 if not found).
-  - `POST /batches`: Seed a new batch into a tray (rejects if tray already has an active batch with 409).
+Implemented in Phase 1: Fastify setup, Zod schemas, in-memory repository abstractions, core tray and batch creation endpoints, standardized error handling, and unit test suites.
 
-### Validation Strategy
-- Request bodies are validated using Zod schemas at the controller boundary.
-- Non-conforming payloads (missing required fields, negative capacity units, invalid date formats, expected harvest date prior to seeding date) trigger HTTP `400 Bad Request`.
+---
 
-### Error Handling
-- Custom error hierarchy (`AppError`, `NotFoundError`, `ConflictError`, `ValidationError`).
-- Consistent HTTP status codes:
-  - `400`: Invalid input or malformed JSON.
-  - `404`: Requested tray or batch does not exist.
-  - `409`: Tray already contains an active batch or duplicate tray code exists.
+## Phase 2 — PostgreSQL + Business Rules
 
-### Important Design Decisions
-1. **UUID v4**: Used for all primary key identifiers to guarantee global uniqueness and eliminate sequential ID enumeration.
-2. **In-Memory Repositories**: Implemented using TypeScript `Map<string, Entity>` wrapped behind clean interfaces (`ITrayRepository`, `IBatchRepository`) to allow seamless drop-in replacement with PostgreSQL in Phase 2.
+### Database Design
+The persistence layer uses PostgreSQL as the single source of truth for invariants and state transitions.
 
-### How to Run Tests
-```bash
-npm run test
+#### Migration Script: `src/db/migrations/001_initial.sql`
+```sql
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE TABLE IF NOT EXISTS trays (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code VARCHAR(50) NOT NULL UNIQUE,
+    zone VARCHAR(50) NOT NULL,
+    capacity_units INT NOT NULL CHECK (capacity_units > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS batches (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tray_id UUID NOT NULL REFERENCES trays(id) ON DELETE RESTRICT,
+    crop VARCHAR(100) NOT NULL,
+    seeded_on DATE NOT NULL,
+    stage VARCHAR(20) NOT NULL CHECK (stage IN ('SEEDED', 'GERMINATION', 'GROWING', 'HARVEST_READY', 'HARVESTED')),
+    expected_harvest_on DATE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_batch_per_tray 
+ON batches(tray_id) 
+WHERE stage <> 'HARVESTED';
+
+CREATE TABLE IF NOT EXISTS harvests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    batch_id UUID NOT NULL UNIQUE REFERENCES batches(id) ON DELETE RESTRICT,
+    harvested_on DATE NOT NULL,
+    weight_grams NUMERIC(10, 2) NOT NULL CHECK (weight_grams >= 0),
+    grade VARCHAR(1) NOT NULL CHECK (grade IN ('A', 'B', 'C')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ```
+
+### Critical Database Constraints & Indexing
+1. **Primary Keys & Foreign Keys**: Standard relational integrity with `ON DELETE RESTRICT` preventing accidental deletion of referenced trays or batches.
+2. **CHECK Constraints**:
+   - `trays.capacity_units > 0`: Prevents non-positive capacity entries.
+   - `batches.stage`: Restricted strictly to valid enum values (`SEEDED`, `GERMINATION`, `GROWING`, `HARVEST_READY`, `HARVESTED`).
+   - `harvests.weight_grams >= 0`: Guarantees non-negative weight measurements.
+   - `harvests.grade`: Restricted strictly to `'A'`, `'B'`, or `'C'`.
+3. **Partial Unique Index (`one_active_batch_per_tray`)**:
+   ```sql
+   CREATE UNIQUE INDEX one_active_batch_per_tray 
+   ON batches(tray_id) 
+   WHERE stage <> 'HARVESTED';
+   ```
+   **Why this works**: A standard `UNIQUE(tray_id)` would prevent a tray from ever being reused once a batch is harvested. The partial unique index enforces uniqueness ONLY for rows where `stage <> 'HARVESTED'`. Once a batch transitions to `'HARVESTED'`, it drops out of the index predicate, allowing a new active batch to be seeded into that tray while preserving complete historical audit records.
+
+### Transactions
+The `POST /batches/:id/harvest` operation requires atomicity:
+1. Verify batch exists and is in `HARVEST_READY` stage (`SELECT ... FOR UPDATE`).
+2. Insert harvest record into `harvests` table.
+3. Update batch stage in `batches` table to `'HARVESTED'`.
+
+These operations are executed inside a single PostgreSQL ACID transaction (`BEGIN ... COMMIT`). If any step fails (e.g. duplicate harvest attempt or date invalidity), the entire transaction is rolled back (`ROLLBACK`), maintaining perfect data integrity.
+
+### Filtering and Pagination (`GET /batches`)
+`GET /batches` supports query parameters:
+- `stage`: Filter by stage (`SEEDED`, `GERMINATION`, `GROWING`, `HARVEST_READY`, `HARVESTED`)
+- `crop`: Case-insensitive partial match search on crop name
+- `zone`: Join with `trays` table to filter by physical zone (`JOIN trays t ON b.tray_id = t.id WHERE LOWER(t.zone) = $1`)
+- `page`: Page number (default: 1)
+- `limit`: Items per page (default: 20, max: 100)
 
 ---
 
@@ -136,56 +180,16 @@ Creates a new tray.
     "capacity_units": 50
   }
   ```
-- **Success Response (201 Created)**:
-  ```json
-  {
-    "id": "c1f7a08b-2d3b-4b2a-8d1e-9f3a2b1c4d5e",
-    "code": "TRAY-001",
-    "zone": "ZONE-A",
-    "capacity_units": 50,
-    "created_at": "2026-09-23T20:00:00.000Z"
-  }
-  ```
-- **Error Response (409 Conflict)**:
-  ```json
-  {
-    "error": {
-      "code": "TRAY_CODE_EXISTS",
-      "message": "Tray with code 'TRAY-001' already exists"
-    }
-  }
-  ```
+- **Success Response (201 Created)**
 
 ### `GET /trays`
-Returns array of all trays.
-- **Success Response (200 OK)**:
-  ```json
-  [
-    {
-      "id": "c1f7a08b-2d3b-4b2a-8d1e-9f3a2b1c4d5e",
-      "code": "TRAY-001",
-      "zone": "ZONE-A",
-      "capacity_units": 50,
-      "created_at": "2026-09-23T20:00:00.000Z"
-    }
-  ]
-  ```
+Lists all trays.
 
 ### `GET /trays/:id`
-Retrieves details of a specific tray.
-- **Success Response (200 OK)**
-- **Error Response (404 Not Found)**:
-  ```json
-  {
-    "error": {
-      "code": "TRAY_NOT_FOUND",
-      "message": "Tray with ID 'c1f7a08b-...' not found"
-    }
-  }
-  ```
+Retrieves details of a single tray.
 
 ### `POST /batches`
-Seeds a new batch into a tray.
+Seeds a new batch into an available tray.
 - **Request Body**:
   ```json
   {
@@ -195,48 +199,74 @@ Seeds a new batch into a tray.
     "expected_harvest_on": "2026-04-01"
   }
   ```
-- **Success Response (201 Created)**:
+- **Success Response (201 Created)**
+
+### `PATCH /batches/:id/stage`
+Advances batch stage forward by one step.
+- **Request Body (Optional)**:
   ```json
   {
-    "id": "b98a7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
-    "tray_id": "c1f7a08b-2d3b-4b2a-8d1e-9f3a2b1c4d5e",
-    "crop": "Romaine Lettuce",
-    "seeded_on": "2026-03-01",
-    "stage": "SEEDED",
-    "expected_harvest_on": "2026-04-01",
-    "created_at": "2026-09-23T20:05:00.000Z"
+    "target_stage": "GERMINATION"
   }
   ```
-- **Error Response (409 Conflict)**:
+- **Success Response (200 OK)**
+
+### `POST /batches/:id/harvest`
+Records a harvest for a `HARVEST_READY` batch and transitions it to `HARVESTED`.
+- **Request Body**:
   ```json
   {
-    "error": {
-      "code": "TRAY_ALREADY_HAS_ACTIVE_BATCH",
-      "message": "Tray already contains an active batch"
-    }
+    "harvested_on": "2026-04-01",
+    "weight_grams": 520.5,
+    "grade": "A"
+  }
+  ```
+- **Success Response (201 Created)**
+
+### `GET /batches`
+Filterable and paginated list of batches.
+- **Query Parameters**: `stage=GROWING&crop=lettuce&zone=ZONE-A&page=1&limit=20`
+- **Success Response (200 OK)**:
+  ```json
+  {
+    "data": [
+      {
+        "id": "b98a7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d",
+        "tray_id": "c1f7a08b-2d3b-4b2a-8d1e-9f3a2b1c4d5e",
+        "crop": "Romaine Lettuce",
+        "seeded_on": "2026-03-01",
+        "stage": "GROWING",
+        "expected_harvest_on": "2026-04-01",
+        "created_at": "2026-09-23T20:05:00.000Z",
+        "zone": "ZONE-A"
+      }
+    ],
+    "total": 1,
+    "page": 1,
+    "limit": 20
   }
   ```
 
 ---
 
-## Rule Enforcement
+## Rule Enforcement Matrix
 
-| Rule | Enforced in Service | Enforced in Database | Reason |
-| :--- | :--- | :--- | :--- |
-| **Valid input schema** | Yes (Zod) | Yes (`CHECK` constraints) | Defense in depth; reject invalid formats early at controller boundary. |
-| **Unique Tray Code** | Yes | Yes (`UNIQUE` constraint) | Prevents duplicate physical tray labeling. |
-| **One active batch per tray** | Yes | Yes (Partial Unique Index `WHERE stage <> 'HARVESTED'`) | Service checks pre-emptively; DB index guarantees atomic concurrency protection. |
-| **Sequential stage transitions** | Yes | No | State machine sequencing is business workflow logic belonging in the service layer. |
-| **Harvest requires `HARVEST_READY`** | Yes | No | Workflow state check before recording harvest payload. |
-| **Single harvest per batch** | Yes | Yes (`UNIQUE(batch_id)`) | Guarantees strict 1:1 ratio between batch and harvest record. |
+| Rule | Enforced in Validation | Enforced in Service | Enforced in Database | Reason |
+| :--- | :--- | :--- | :--- | :--- |
+| **Valid enum values / types** | Yes (Zod) | No | Yes (`CHECK`) | Defense in depth; invalid inputs are rejected before entering domain logic. |
+| **Unique Tray Code** | No | Yes | Yes (`UNIQUE`) | Database guarantees uniqueness across concurrent requests. |
+| **One active batch per tray** | No | Yes | Yes (Partial Index) | Database constraint protects against race conditions across app instances. |
+| **Sequential stage transitions** | No | Yes | No | Workflow sequencing is domain state machine logic. |
+| **Harvest requires `HARVEST_READY`** | No | Yes | Transaction Check | Verified under transaction lock (`FOR UPDATE`). |
+| **Single harvest per batch** | No | Yes | Yes (`UNIQUE(batch_id)`) | Prevents duplicate harvest records at DB engine level. |
 
 ---
 
 ## Assumptions
 
 1. **Date Formatting**: All date inputs (`seeded_on`, `expected_harvest_on`, `harvested_on`) require ISO 8601 calendar date format `YYYY-MM-DD`.
-2. **Case Sensitivity**: Tray codes are compared case-insensitively to prevent duplicates like `tray-01` and `TRAY-01`. Crop names match case-insensitively during search filtering.
-3. **Stage Patch Parameter**: `PATCH /batches/:id/stage` can accept an optional `{ "target_stage": "GERMINATION" }` payload or operate without a payload to auto-advance to the immediate next stage.
+2. **Case Sensitivity**: Tray codes are compared case-insensitively. Crop names match case-insensitively during search filtering.
+3. **Stage Patch Parameter**: `PATCH /batches/:id/stage` accepts an optional `{ "target_stage": "GERMINATION" }` or auto-advances to the immediate next stage if no payload is provided.
 
 ---
 
@@ -245,6 +275,9 @@ Seeds a new batch into a tray.
 Implemented with Vitest:
 - `tests/tray.test.ts`: Tray creation, validation, unique code constraint, 404 & 400 error responses.
 - `tests/batch.test.ts`: Batch seeding, validation, single active batch constraint enforcement (409).
+- `tests/stage.test.ts`: Sequential stage progression, prevention of stage skipping and backward movement.
+- `tests/harvest.test.ts`: Atomic harvest creation, `HARVEST_READY` requirement, tray reuse after harvest, single harvest limit.
+- `tests/filtering.test.ts`: `GET /batches` filtering by stage, crop, zone (JOIN), and pagination structure.
 
 Run tests:
 ```bash
@@ -257,7 +290,7 @@ npm run test
 
 1. **Clone repository**:
    ```bash
-   git clone <repo-url>
+   git clone https://github.com/Abhinav053/AgResearch_Labs_assignment.git
    cd Argo
    ```
 2. **Install dependencies**:
@@ -268,7 +301,7 @@ npm run test
    ```bash
    cp .env.example .env
    ```
-4. **Run Phase 1 in Development mode**:
+4. **Run Server**:
    ```bash
    npm run dev
    ```
@@ -286,21 +319,21 @@ npm run test
 | `PORT` | `3000` | HTTP server port |
 | `HOST` | `0.0.0.0` | Binding host address |
 | `NODE_ENV` | `development` | Environment mode (`development` / `test` / `production`) |
-| `DATABASE_URL` | - | PostgreSQL connection string (Phase 2 & 3) |
-| `TEST_DATABASE_URL` | - | PostgreSQL test connection string (Phase 2 & 3) |
+| `DATABASE_URL` | - | PostgreSQL connection string |
+| `TEST_DATABASE_URL` | - | PostgreSQL test database connection string |
 
 ---
 
 ## What I Did Not Finish
 
-Phase 1 is 100% complete and fully tested. PostgreSQL integration (Phase 2) and Concurrency testing (Phase 3) will be implemented in subsequent phases.
+Phases 1 & 2 are 100% complete and fully tested. Phase 3 (Concurrency Safety Integration Test against live Postgres) will be completed next.
 
 ---
 
 ## AI Usage
 
 ### Tools Used
-- **Antigravity (Gemini 3.6 Flash)**: Architecture design, Fastify route setup, Zod schema validation, Vitest test suite construction.
+- **Antigravity (Gemini 3.6 Flash)**: Architecture design, Fastify route setup, Zod schema validation, PostgreSQL partial indexing, Vitest test construction.
 
 ### Where AI Was Used
-- Assisting in setting up TypeScript project structure, domain error hierarchy, and designing clean repository abstractions for switching between memory and PostgreSQL storage.
+- Assisting in setting up TypeScript project structure, domain error hierarchy, PostgreSQL schema migrations, and designing clean repository abstractions.

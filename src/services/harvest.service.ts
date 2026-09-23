@@ -10,6 +10,15 @@ export class HarvestService {
   ) {}
 
   async recordHarvest(batchId: string, input: CreateHarvestInput): Promise<Harvest> {
+    // If PostgreSQL repository with transaction support is available, use it
+    if (
+      'createHarvestTransaction' in this.harvestRepo &&
+      typeof (this.harvestRepo as any).createHarvestTransaction === 'function'
+    ) {
+      return (this.harvestRepo as any).createHarvestTransaction(batchId, input);
+    }
+
+    // Fallback logic for In-Memory storage (Phase 1)
     const batch = await this.batchRepo.findById(batchId);
     if (!batch) {
       throw new NotFoundError(
