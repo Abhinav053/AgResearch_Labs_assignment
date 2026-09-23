@@ -8,7 +8,9 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/src/server.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "migrate": "tsx src/db/migrate.ts",
+    "seed": "tsx src/db/seed.ts"
   },
   "keywords": [],
   "author": "",
