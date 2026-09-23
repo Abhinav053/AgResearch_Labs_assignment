@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc",
+    "build": "tsc && node -e \"fs.mkdirSync('dist/src/db/migrations', { recursive: true }); fs.copyFileSync('src/db/migrations/001_initial.sql', 'dist/src/db/migrations/001_initial.sql')\"",
     "start": "node dist/src/server.js",
     "test": "vitest run",
     "migrate": "tsx src/db/migrate.ts",

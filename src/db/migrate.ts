@@ -4,12 +4,12 @@ import { config } from '../config/env.js';
 
 const { Client } = pg;
 
-async function ensureDatabaseExists(dbUrl: string) {
+export async function ensureDatabaseExists(dbUrl: string) {
   try {
     const url = new URL(dbUrl);
     const dbName = url.pathname.slice(1);
     
-    // Connect to default 'postgres' database to create the target database if missing
+    // Connect to default 'postgres' database to create target database if missing
     url.pathname = '/postgres';
     const client = new Client({ connectionString: url.toString() });
 
@@ -31,9 +31,11 @@ async function ensureDatabaseExists(dbUrl: string) {
 }
 
 async function migrate() {
-  const dbUrl = config.DATABASE_URL;
-  if (dbUrl) {
-    await ensureDatabaseExists(dbUrl);
+  if (config.DATABASE_URL) {
+    await ensureDatabaseExists(config.DATABASE_URL);
+  }
+  if (config.TEST_DATABASE_URL) {
+    await ensureDatabaseExists(config.TEST_DATABASE_URL);
   }
 
   const pool = createPool();
@@ -51,4 +53,7 @@ async function migrate() {
   }
 }
 
-migrate();
+// Execute if run directly
+if (import.meta.url === `file://${process.argv[1]}`) {
+  migrate();
+}
