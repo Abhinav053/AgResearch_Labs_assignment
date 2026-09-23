@@ -96,75 +96,57 @@ Implemented in Phase 1: Fastify setup, Zod schemas, in-memory repository abstrac
 
 ## Phase 2 — PostgreSQL + Business Rules
 
-### Database Design
-The persistence layer uses PostgreSQL as the single source of truth for invariants and state transitions.
+Implemented in Phase 2: PostgreSQL schema migration (`001_initial.sql`), `pg` pool connection management, PostgreSQL repositories, sequential stage transition endpoint, atomic harvest transaction management, and filterable/paginated batch listing.
 
-#### Migration Script: `src/db/migrations/001_initial.sql`
-```sql
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+---
 
-CREATE TABLE IF NOT EXISTS trays (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    code VARCHAR(50) NOT NULL UNIQUE,
-    zone VARCHAR(50) NOT NULL,
-    capacity_units INT NOT NULL CHECK (capacity_units > 0),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+## Phase 3 — Concurrency Safety
 
-CREATE TABLE IF NOT EXISTS batches (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tray_id UUID NOT NULL REFERENCES trays(id) ON DELETE RESTRICT,
-    crop VARCHAR(100) NOT NULL,
-    seeded_on DATE NOT NULL,
-    stage VARCHAR(20) NOT NULL CHECK (stage IN ('SEEDED', 'GERMINATION', 'GROWING', 'HARVEST_READY', 'HARVESTED')),
-    expected_harvest_on DATE NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+### 1. The Race Condition Problem
+In a naive application-level implementation, batch creation relies on a "check-then-insert" pattern:
 
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_batch_per_tray 
-ON batches(tray_id) 
-WHERE stage <> 'HARVESTED';
-
-CREATE TABLE IF NOT EXISTS harvests (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    batch_id UUID NOT NULL UNIQUE REFERENCES batches(id) ON DELETE RESTRICT,
-    harvested_on DATE NOT NULL,
-    weight_grams NUMERIC(10, 2) NOT NULL CHECK (weight_grams >= 0),
-    grade VARCHAR(1) NOT NULL CHECK (grade IN ('A', 'B', 'C')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+```
+Request A ──► Read DB (Active batch exists? NO) ──────────────────────────► INSERT Batch A (Success)
+Request B ──────► Read DB (Active batch exists? NO) ──► INSERT Batch B (Success - DUP ACTIVE BATCH!)
 ```
 
-### Critical Database Constraints & Indexing
-1. **Primary Keys & Foreign Keys**: Standard relational integrity with `ON DELETE RESTRICT` preventing accidental deletion of referenced trays or batches.
-2. **CHECK Constraints**:
-   - `trays.capacity_units > 0`: Prevents non-positive capacity entries.
-   - `batches.stage`: Restricted strictly to valid enum values (`SEEDED`, `GERMINATION`, `GROWING`, `HARVEST_READY`, `HARVESTED`).
-   - `harvests.weight_grams >= 0`: Guarantees non-negative weight measurements.
-   - `harvests.grade`: Restricted strictly to `'A'`, `'B'`, or `'C'`.
-3. **Partial Unique Index (`one_active_batch_per_tray`)**:
-   ```sql
-   CREATE UNIQUE INDEX one_active_batch_per_tray 
-   ON batches(tray_id) 
-   WHERE stage <> 'HARVESTED';
-   ```
-   **Why this works**: A standard `UNIQUE(tray_id)` would prevent a tray from ever being reused once a batch is harvested. The partial unique index enforces uniqueness ONLY for rows where `stage <> 'HARVESTED'`. Once a batch transitions to `'HARVESTED'`, it drops out of the index predicate, allowing a new active batch to be seeded into that tray while preserving complete historical audit records.
+If two HTTP requests arrive concurrently at the application layer, both read operations can execute before either write operation completes. Both requests see that no active batch exists and proceed to insert, causing a critical business invariant failure: **two active batches existing in the same physical tray**.
 
-### Transactions
-The `POST /batches/:id/harvest` operation requires atomicity:
-1. Verify batch exists and is in `HARVEST_READY` stage (`SELECT ... FOR UPDATE`).
-2. Insert harvest record into `harvests` table.
-3. Update batch stage in `batches` table to `'HARVESTED'`.
+### 2. Why Application-Level Checks Are Unsafe
+1. **Time of Check to Time of Use (TOCTOU)**: There is a non-zero time gap between checking availability in application code and committing the insert to the database.
+2. **Horizontal Scaling**: If multiple API app instances run behind a load balancer, in-memory mutexes or local variables in Node.js cannot synchronize state across distinct OS processes or server nodes.
 
-These operations are executed inside a single PostgreSQL ACID transaction (`BEGIN ... COMMIT`). If any step fails (e.g. duplicate harvest attempt or date invalidity), the entire transaction is rolled back (`ROLLBACK`), maintaining perfect data integrity.
+### 3. PostgreSQL Partial Unique Index Solution
+PostgreSQL prevents race conditions at the database engine level via a **Partial Unique Index**:
 
-### Filtering and Pagination (`GET /batches`)
-`GET /batches` supports query parameters:
-- `stage`: Filter by stage (`SEEDED`, `GERMINATION`, `GROWING`, `HARVEST_READY`, `HARVESTED`)
-- `crop`: Case-insensitive partial match search on crop name
-- `zone`: Join with `trays` table to filter by physical zone (`JOIN trays t ON b.tray_id = t.id WHERE LOWER(t.zone) = $1`)
-- `page`: Page number (default: 1)
-- `limit`: Items per page (default: 20, max: 100)
+```sql
+CREATE UNIQUE INDEX one_active_batch_per_tray 
+ON batches(tray_id) 
+WHERE stage <> 'HARVESTED';
+```
+
+#### How it works:
+- **Indexing Predicate**: The index indexes rows where `stage <> 'HARVESTED'`.
+- **Atomic Index Enforcement**: When an `INSERT INTO batches` statement executes, PostgreSQL acquires a page-level lock on the index tree.
+- **Serialization Guarantee**: Even if two transactions execute `INSERT` at the exact same microsecond, PostgreSQL serializes index tree updates. The first insertion succeeds. The second insertion attempts to write an identical `tray_id` key into the index, fails with SQL state `23505` (`unique_violation`), and aborts.
+- **Repository Error Translation**: `PgBatchRepository` intercepts error `23505` and raises a clean domain `ConflictError`, returning HTTP status `409` with code `TRAY_ALREADY_HAS_ACTIVE_BATCH`.
+
+### 4. Multi-Instance Load Balancer Behavior
+Because the concurrency invariant is enforced by PostgreSQL's write-ahead log (WAL) and B-tree index locking, running 10 or 100 API instances behind an NGINX or AWS ALB load balancer retains 100% concurrency safety. The database server acts as the single central authority for transactional invariants.
+
+### 5. Automated Concurrency Test Proof
+The integration test in `tests/concurrency.test.ts` fires two genuinely concurrent requests using `Promise.all`:
+
+```typescript
+const [res1, res2] = await Promise.all([
+  app.inject({ method: 'POST', url: '/batches', payload: payload1 }),
+  app.inject({ method: 'POST', url: '/batches', payload: payload2 }),
+]);
+
+expect(successfulRequests).toBe(1);
+expect(conflictRequests).toBe(1);
+```
+Executing this test proves that `successfulRequests === 1` (201 Created) and `conflictRequests === 1` (409 Conflict).
 
 ---
 
@@ -200,6 +182,7 @@ Seeds a new batch into an available tray.
   }
   ```
 - **Success Response (201 Created)**
+- **Error Response (409 Conflict)**: Returned if tray already contains an active batch.
 
 ### `PATCH /batches/:id/stage`
 Advances batch stage forward by one step.
@@ -278,6 +261,7 @@ Implemented with Vitest:
 - `tests/stage.test.ts`: Sequential stage progression, prevention of stage skipping and backward movement.
 - `tests/harvest.test.ts`: Atomic harvest creation, `HARVEST_READY` requirement, tray reuse after harvest, single harvest limit.
 - `tests/filtering.test.ts`: `GET /batches` filtering by stage, crop, zone (JOIN), and pagination structure.
+- `tests/concurrency.test.ts`: Genuinely concurrent batch seeding requests (`Promise.all`), verifying 1 success (201) and 1 conflict (409).
 
 Run tests:
 ```bash
@@ -326,14 +310,14 @@ npm run test
 
 ## What I Did Not Finish
 
-Phases 1 & 2 are 100% complete and fully tested. Phase 3 (Concurrency Safety Integration Test against live Postgres) will be completed next.
+All requirements across Part 1, Part 2, and Part 3a are 100% complete, fully implemented, verified, and documented.
 
 ---
 
 ## AI Usage
 
 ### Tools Used
-- **Antigravity (Gemini 3.6 Flash)**: Architecture design, Fastify route setup, Zod schema validation, PostgreSQL partial indexing, Vitest test construction.
+- **Antigravity (Gemini 3.6 Flash)**: Architecture design, Fastify route setup, Zod schema validation, PostgreSQL partial indexing, Vitest concurrency test construction.
 
 ### Where AI Was Used
 - Assisting in setting up TypeScript project structure, domain error hierarchy, PostgreSQL schema migrations, and designing clean repository abstractions.
